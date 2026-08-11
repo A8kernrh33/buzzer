@@ -16,7 +16,7 @@ function sendNtfy(message) {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
         'Content-Length': Buffer.byteLength(message),
-        'Title': '🔔 Someone is buzzing you!',
+        'Title': 'Someone is buzzing you!',
         'Priority': '5',
         'Tags': 'bell'
       }
