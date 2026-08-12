@@ -5,6 +5,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const NTFY_TOPIC = process.env.NTFY_TOPIC || 'buzz_hpEpfFthFPlmDD778TYKlcSl';
 
+// Keep ntfy traffic low: one immediate notification, then batch extra buzzes
+// that arrive during the next 10 seconds into a single follow-up.
+const COOLDOWN_MS = 10_000;
+let lastSentAt = 0;
+let pendingBuzzes = [];
+let batchTimer = null;
+
 app.use(express.json());
 app.use(express.static(__dirname));
 
@@ -40,15 +47,53 @@ function sendNtfy(message) {
   });
 }
 
-app.post('/api/buzz', async (req, res) => {
+async function flushPending() {
+  batchTimer = null;
+  if (!pendingBuzzes.length) return;
+
+  const names = pendingBuzzes.splice(0, pendingBuzzes.length);
+  const uniqueNames = [...new Set(names)];
+  const summary = uniqueNames.length === 1
+    ? `${uniqueNames[0]} buzzed again ${names.length} times during the cooldown.`
+    : `${names.length} additional buzzes from ${uniqueNames.join(', ')} during the cooldown.`;
+
   try {
-    const name = String(req.body?.name || 'Someone').slice(0, 40);
-    await sendNtfy(`${name} pressed the BUZZ button.`);
-    res.json({ ok: true });
+    await sendNtfy(summary);
+    lastSentAt = Date.now();
   } catch (error) {
-    console.error('BUZZ ERROR:', error);
-    res.status(502).json({ error: `Could not send notification: ${error.message}` });
+    console.error('BATCH BUZZ ERROR:', error);
+    // Put the names back so the next buzz can retry the batch.
+    pendingBuzzes.unshift(...names);
   }
+}
+
+app.post('/api/buzz', async (req, res) => {
+  const name = String(req.body?.name || 'Someone').trim().slice(0, 40) || 'Someone';
+  const now = Date.now();
+  const elapsed = now - lastSentAt;
+
+  // First buzz: send immediately.
+  if (elapsed >= COOLDOWN_MS && pendingBuzzes.length === 0) {
+    try {
+      await sendNtfy(`${name} pressed the BUZZ button.`);
+      lastSentAt = Date.now();
+      return res.json({ ok: true, mode: 'sent' });
+    } catch (error) {
+      console.error('BUZZ ERROR:', error);
+      return res.status(502).json({ error: `Could not send notification: ${error.message}` });
+    }
+  }
+
+  // Extra buzzes during the cooldown are queued instead of becoming
+  // individual ntfy messages.
+  pendingBuzzes.push(name);
+  if (!batchTimer) {
+    const remaining = Math.max(0, COOLDOWN_MS - elapsed);
+    batchTimer = setTimeout(flushPending, remaining);
+  }
+
+  const waitSeconds = Math.ceil(Math.max(0, COOLDOWN_MS - elapsed) / 1000);
+  res.json({ ok: true, mode: 'queued', waitSeconds });
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
