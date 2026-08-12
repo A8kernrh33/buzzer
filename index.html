@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Buzz Me</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Summon Piggy on your will 24/7</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;background:#111827;color:#fff}
@@ -15,7 +15,7 @@ button:disabled{opacity:.6;cursor:not-allowed}
 </head>
 <body>
 <main class="card">
-<h1>🔔 Buzz Me</h1>
+<h1>🔔 Summon Piggy on your will 24/7</h1>
 <p>Press the button to get their attention.</p>
 <input id="name" maxlength="40" placeholder="Your name (optional)">
 <button id="buzz">🔔 BUZZ</button>
@@ -47,12 +47,10 @@ b.onclick=async()=>{
     }
   }catch(e){
     s.textContent='❌ '+e.message;
-    // Allow retry after a short failure cooldown.
     setTimeout(()=>{localCooldown=false;b.disabled=false},3000);
     return;
   }
 
-  // Prevent accidental double taps for 10 seconds.
   let remaining=10;
   const timer=setInterval(()=>{
     remaining--;
