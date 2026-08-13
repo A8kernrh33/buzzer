@@ -24,6 +24,7 @@ label{display:block;text-align:left;margin:0 0 8px 4px;color:#9f8e9b;font-size:1
 input{width:100%;padding:15px 16px;border:1px solid var(--line);outline:none;border-radius:14px;margin-bottom:14px;font:500 15px Inter,sans-serif;background:#0d0a0f;color:var(--text);transition:.2s}
 input::placeholder{color:#665865}
 input:focus{border-color:#9f4669;box-shadow:0 0 0 3px #ff4f9112}
+input:invalid:not(:placeholder-shown){border-color:#8e294e}
 button{position:relative;width:100%;padding:19px 18px;border:0;border-radius:15px;font:900 19px Inter,sans-serif;letter-spacing:.02em;cursor:pointer;background:linear-gradient(135deg,#ff3d83,#e92b65);color:#fff;box-shadow:0 12px 30px #ff2f5f30,0 3px 0 #a81949;transition:transform .12s,box-shadow .12s,filter .12s}
 button:hover:not(:disabled){transform:translateY(-2px);filter:brightness(1.08);box-shadow:0 16px 38px #ff2f5f45,0 4px 0 #a81949}
 button:active:not(:disabled){transform:translateY(2px);box-shadow:0 5px 16px #ff2f5f30,0 1px 0 #a81949}
@@ -42,8 +43,8 @@ button:disabled{opacity:.55;cursor:not-allowed}
 
   <div class="insult">No excuses. No hiding. No pretending you're important.<br><b>I'm here to be summoned.</b></div>
 
-  <label for="name">Identify yourself, piggy</label>
-  <input id="name" maxlength="40" placeholder="Your name (optional)" autocomplete="nickname">
+  <label for="name">Enter your name, Superior</label>
+  <input id="name" maxlength="40" placeholder="Your name is required" autocomplete="name" required>
   <button id="buzz">♛ SUMMON PIGGY</button>
   <div id="status" aria-live="polite"></div>
 
@@ -54,6 +55,12 @@ const b=document.getElementById('buzz'),n=document.getElementById('name'),s=docu
 let localCooldown=false;
 
 b.onclick=async()=>{
+  const name=n.value.trim();
+  if(!name){
+    n.focus();
+    s.textContent='⚠️ A superior must identify herself before issuing a summon.';
+    return;
+  }
   if(localCooldown) return;
   localCooldown=true;
   b.disabled=true;
@@ -63,7 +70,7 @@ b.onclick=async()=>{
     const r=await fetch('/api/buzz',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:n.value.trim()||'Someone'})
+      body:JSON.stringify({name})
     });
     const d=await r.json().catch(()=>({}));
     if(!r.ok) throw Error(d.error||`Server returned HTTP ${r.status}`);
