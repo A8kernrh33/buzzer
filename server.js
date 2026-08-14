@@ -12,6 +12,7 @@ let pendingBuzzes = [];
 let batchTimer = null;
 let history = [];
 let lastDelivery = { status: 'ready', name: null, command: null, at: null };
+let historyDb = null;
 
 app.use(express.json({ limit: '8kb' }));
 app.use(express.static(__dirname));
@@ -26,9 +27,40 @@ function initFirebase() {
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 }
 
+function getHistoryDb() {
+  initFirebase();
+  if (!historyDb) historyDb = admin.firestore().collection('summonHistory');
+  return historyDb;
+}
+
+async function loadHistory() {
+  try {
+    const snapshot = await getHistoryDb().orderBy('atMs', 'desc').limit(HISTORY_LIMIT).get();
+    history = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return { name: data.name || '', command: data.command || null, status: data.status || 'delivered', at: new Date(data.atMs || Date.now()).toISOString() };
+    });
+    console.log(`Loaded ${history.length} summon history entries from Firestore.`);
+  } catch (error) {
+    console.error('HISTORY LOAD ERROR:', error.message);
+    console.error('Enable Firestore in the Firebase project if it has not been enabled yet.');
+  }
+}
+
 function addHistory(entry) {
-  history.unshift({ ...entry, at: new Date().toISOString() });
+  const record = { ...entry, at: new Date().toISOString() };
+  history.unshift(record);
   history = history.slice(0, HISTORY_LIMIT);
+  try {
+    getHistoryDb().add({
+      name: record.name || '',
+      command: record.command || null,
+      status: record.status || 'delivered',
+      atMs: Date.now()
+    }).catch(error => console.error('HISTORY SAVE ERROR:', error.message));
+  } catch (error) {
+    console.error('HISTORY SAVE ERROR:', error.message);
+  }
 }
 
 async function sendFcm(name, command = '', extra = false) {
@@ -106,4 +138,8 @@ app.get('/api/status', (req, res) => {
   res.json({ online: true, ready: remainingMs === 0 && pendingBuzzes.length === 0, cooldownSeconds: Math.ceil(remainingMs / 1000), pending: pendingBuzzes.length, lastDelivery });
 });
 app.get('/health', (req, res) => res.json({ ok: true }));
-app.listen(PORT, '0.0.0.0', () => console.log(`Buzz server listening on port ${PORT}`));
+
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`Buzz server listening on port ${PORT}`);
+  await loadHistory();
+});
