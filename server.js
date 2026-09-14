@@ -4,12 +4,10 @@ const admin = require('firebase-admin');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const FCM_DEVICE_TOKEN = process.env.FCM_DEVICE_TOKEN;
-const COOLDOWN_MS = 10_000;
+const COOLDOWN_MS = 60_000;
 const HISTORY_LIMIT = 25;
 
 let lastSentAt = 0;
-let pendingBuzzes = [];
-let batchTimer = null;
 let history = [];
 let lastDelivery = { status: 'ready', name: null, command: null, at: null };
 let historyDb = null;
@@ -63,7 +61,7 @@ function addHistory(entry) {
   }
 }
 
-async function sendFcm(name, command = '', extra = false) {
+async function sendFcm(name, command = '') {
   if (!FCM_DEVICE_TOKEN) throw new Error('FCM_DEVICE_TOKEN is not configured');
   initFirebase();
   await admin.messaging().send({
@@ -71,32 +69,10 @@ async function sendFcm(name, command = '', extra = false) {
     data: {
       name: name.slice(0, 40),
       command: command.slice(0, 180),
-      type: 'buzz',
-      extra: extra ? 'true' : 'false'
+      type: 'buzz'
     },
     android: { priority: 'high', ttl: 60 * 1000 }
   });
-}
-
-async function flushPending() {
-  batchTimer = null;
-  if (!pendingBuzzes.length) return;
-  const pending = pendingBuzzes.splice(0, pendingBuzzes.length);
-  const uniqueNames = [...new Set(pending.map(x => x.name))];
-  const summaryName = uniqueNames.length === 1
-    ? `${uniqueNames[0]} buzzed again ${pending.length} times during the cooldown.`
-    : `${pending.length} additional buzzes from ${uniqueNames.join(', ')} during the cooldown.`;
-  const summaryCommand = pending.map(x => x.command).filter(Boolean).slice(0, 3).join(' · ');
-  try {
-    await sendFcm(summaryName, summaryCommand, true);
-    lastSentAt = Date.now();
-    lastDelivery = { status: 'delivered', name: summaryName, command: summaryCommand || null, at: new Date().toISOString() };
-    pending.forEach(item => addHistory({ name: item.name, command: item.command || null, status: 'delivered' }));
-  } catch (error) {
-    console.error('BATCH BUZZ ERROR:', error);
-    pendingBuzzes.unshift(...pending);
-    lastDelivery = { status: 'error', name: null, command: error.message, at: new Date().toISOString() };
-  }
 }
 
 app.post('/api/buzz', async (req, res) => {
@@ -104,38 +80,35 @@ app.post('/api/buzz', async (req, res) => {
   const command = String(req.body?.command || '').trim().slice(0, 180);
   if (!name) return res.status(400).json({ error: 'Superior name is required.' });
 
-  const now = Date.now();
-  const elapsed = now - lastSentAt;
+  const elapsed = Date.now() - lastSentAt;
+  const remainingMs = Math.max(0, COOLDOWN_MS - elapsed);
 
-  if (elapsed >= COOLDOWN_MS && pendingBuzzes.length === 0) {
-    try {
-      await sendFcm(name, command);
-      lastSentAt = Date.now();
-      lastDelivery = { status: 'delivered', name, command: command || null, at: new Date().toISOString() };
-      addHistory({ name, command: command || null, status: 'delivered' });
-      return res.json({ ok: true, mode: 'sent' });
-    } catch (error) {
-      console.error('BUZZ ERROR:', error);
-      addHistory({ name, command: command || null, status: 'failed' });
-      lastDelivery = { status: 'error', name, command: error.message, at: new Date().toISOString() };
-      return res.status(502).json({ error: `Could not send buzz: ${error.message}` });
-    }
+  if (remainingMs > 0) {
+    const waitSeconds = Math.ceil(remainingMs / 1000);
+    return res.status(429).json({
+      error: `The summon button is on cooldown. Try again in ${waitSeconds}s.`,
+      waitSeconds
+    });
   }
 
-  pendingBuzzes.push({ name, command });
-  addHistory({ name, command: command || null, status: 'queued' });
-  if (!batchTimer) {
-    const remaining = Math.max(0, COOLDOWN_MS - elapsed);
-    batchTimer = setTimeout(flushPending, remaining);
+  try {
+    await sendFcm(name, command);
+    lastSentAt = Date.now();
+    lastDelivery = { status: 'delivered', name, command: command || null, at: new Date().toISOString() };
+    addHistory({ name, command: command || null, status: 'delivered' });
+    return res.json({ ok: true, mode: 'sent', cooldownSeconds: 60 });
+  } catch (error) {
+    console.error('BUZZ ERROR:', error);
+    addHistory({ name, command: command || null, status: 'failed' });
+    lastDelivery = { status: 'error', name, command: error.message, at: new Date().toISOString() };
+    return res.status(502).json({ error: `Could not send buzz: ${error.message}` });
   }
-  const waitSeconds = Math.ceil(Math.max(0, COOLDOWN_MS - elapsed) / 1000);
-  res.json({ ok: true, mode: 'queued', waitSeconds });
 });
 
 app.get('/api/history', (req, res) => res.json({ history }));
 app.get('/api/status', (req, res) => {
   const remainingMs = Math.max(0, COOLDOWN_MS - (Date.now() - lastSentAt));
-  res.json({ online: true, ready: remainingMs === 0 && pendingBuzzes.length === 0, cooldownSeconds: Math.ceil(remainingMs / 1000), pending: pendingBuzzes.length, lastDelivery });
+  res.json({ online: true, ready: remainingMs === 0, cooldownSeconds: Math.ceil(remainingMs / 1000), pending: 0, lastDelivery });
 });
 app.get('/health', (req, res) => res.json({ ok: true }));
 
