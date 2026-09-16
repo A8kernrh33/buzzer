@@ -1,167 +1,36 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const FCM_DEVICE_TOKEN = process.env.FCM_DEVICE_TOKEN;
 const SUPERIOR_PASSWORD = process.env.SUPERIOR_PASSWORD;
 const GOD_PASSWORD = process.env.GOD_PASSWORD;
-const COOLDOWN_MS = 60_000;
-const HISTORY_LIMIT = 50;
-const SESSION_MS = 12 * 60 * 60 * 1000;
-
-let lastSentAt = 0;
-let history = [];
-let lastDelivery = { status: 'ready', name: null, command: null, at: null };
-let historyDb = null;
-const sessions = new Map();
-const loginAttempts = new Map();
-
-app.use(express.json({ limit: '12kb' }));
-app.use(express.static(__dirname));
-
-function initFirebase() {
-  if (admin.apps.length) return;
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not configured');
-  let serviceAccount;
-  try { serviceAccount = JSON.parse(raw); }
-  catch { throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON'); }
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-}
-
-function getHistoryDb() {
-  initFirebase();
-  if (!historyDb) historyDb = admin.firestore().collection('summonHistory');
-  return historyDb;
-}
-
-async function loadHistory() {
-  try {
-    const snapshot = await getHistoryDb().orderBy('atMs', 'desc').limit(HISTORY_LIMIT).get();
-    history = snapshot.docs.map(doc => {
-      const d = doc.data();
-      return { name: d.name || '', command: d.command || null, status: d.status || 'delivered', access: d.access || null, at: new Date(d.atMs || Date.now()).toISOString() };
-    });
-  } catch (error) { console.error('HISTORY LOAD ERROR:', error.message); }
-}
-
-function addHistory(entry) {
-  const record = { ...entry, at: new Date().toISOString() };
-  history.unshift(record);
-  history = history.slice(0, HISTORY_LIMIT);
-  try {
-    getHistoryDb().add({ name: record.name || '', command: record.command || null, status: record.status || 'delivered', access: record.access || null, atMs: Date.now() })
-      .catch(error => console.error('HISTORY SAVE ERROR:', error.message));
-  } catch (error) { console.error('HISTORY SAVE ERROR:', error.message); }
-}
-
-async function sendFcm(data) {
-  if (!FCM_DEVICE_TOKEN) throw new Error('FCM_DEVICE_TOKEN is not configured');
-  initFirebase();
-  const clean = {};
-  for (const [key, value] of Object.entries(data)) clean[key] = String(value ?? '').slice(0, 500);
-  await admin.messaging().send({ token: FCM_DEVICE_TOKEN, data: clean, android: { priority: 'high', ttl: 60 * 1000 } });
-}
-
-function getRemainingCooldown() { return Math.max(0, COOLDOWN_MS - (Date.now() - lastSentAt)); }
-function getClientIp(req) { return String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim(); }
-function issueSession(role) { const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, { role, expires: Date.now() + SESSION_MS }); return token; }
-function requireRole(role) {
-  return (req, res, next) => {
-    const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
-    const session = token ? sessions.get(token) : null;
-    if (!session || session.expires < Date.now() || (role === 'superior' && session.role !== 'superior' && session.role !== 'god') || (role === 'god' && session.role !== 'god')) {
-      if (token && session?.expires < Date.now()) sessions.delete(token);
-      return res.status(401).json({ error: `${role === 'god' ? 'God' : 'Superior'} authentication required.` });
-    }
-    req.auth = session;
-    req.authToken = token;
-    next();
-  };
-}
-
-function loginForRole(role, password, req, res) {
-  const configured = role === 'god' ? GOD_PASSWORD : SUPERIOR_PASSWORD;
-  if (!configured) return res.status(503).json({ error: `${role === 'god' ? 'GOD_PASSWORD' : 'SUPERIOR_PASSWORD'} is not configured on the server.` });
-  const ip = getClientIp(req), now = Date.now();
-  const key = `${role}:${ip}`;
-  const recent = (loginAttempts.get(key) || []).filter(t => now - t < 10 * 60 * 1000);
-  if (recent.length >= 10) return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
-  recent.push(now); loginAttempts.set(key, recent);
-  const supplied = String(password || ''), a = Buffer.from(supplied), b = Buffer.from(configured);
-  const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
-  if (!valid) return res.status(401).json({ error: `Incorrect ${role === 'god' ? 'God' : 'Superior'} password.` });
-  const token = issueSession(role);
-  res.json({ ok: true, role, token, expiresInSeconds: Math.floor(SESSION_MS / 1000) });
-}
-
-app.post('/api/superior/login', (req, res) => loginForRole('superior', req.body?.password, req, res));
-app.post('/api/god/login', (req, res) => loginForRole('god', req.body?.password, req, res));
-
-app.post('/api/superior/logout', requireRole('superior'), (req, res) => { sessions.delete(req.authToken); res.json({ ok: true }); });
-app.post('/api/god/logout', requireRole('god'), (req, res) => { sessions.delete(req.authToken); res.json({ ok: true }); });
-
-app.get('/api/superior/status', requireRole('superior'), (req, res) => res.json({ ok: true, authenticated: true, role: req.auth.role, controls: ['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake'] }));
-app.get('/api/god/status', requireRole('god'), (req, res) => res.json({ ok: true, authenticated: true, role: 'god', controls: ['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake'] }));
-
-app.post('/api/buzz', async (req, res) => {
-  const name = String(req.body?.name || '').trim().slice(0, 40);
-  const message = String(req.body?.message || '').trim().slice(0, 300);
-  if (!name) return res.status(400).json({ error: 'Your name is required.' });
-  const remainingMs = getRemainingCooldown();
-  if (remainingMs > 0) return res.status(429).json({ error: `The summon button is on cooldown. Try again in ${Math.ceil(remainingMs / 1000)}s.`, waitSeconds: Math.ceil(remainingMs / 1000) });
-  try {
-    await sendFcm({ name, message, command: 'summon', type: 'buzz' });
-    lastSentAt = Date.now();
-    lastDelivery = { status: 'delivered', name, command: 'summon', at: new Date().toISOString() };
-    addHistory({ name, command: 'summon', status: 'delivered', access: 'public' });
-    res.json({ ok: true, mode: 'sent', cooldownSeconds: 60 });
-  } catch (error) {
-    console.error('BUZZ ERROR:', error);
-    addHistory({ name, command: 'summon', status: 'failed', access: 'public' });
-    lastDelivery = { status: 'error', name, command: error.message, at: new Date().toISOString() };
-    res.status(502).json({ error: `Could not send buzz: ${error.message}` });
-  }
-});
-
-const DEVICE_COMMANDS = new Set(['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake']);
-
-async function sendAuthorizedCommand(req, res, role) {
-  const command = String(req.body?.command || '').trim().toLowerCase();
-  if (!DEVICE_COMMANDS.has(command)) return res.status(400).json({ error: 'Unsupported control.' });
-  const name = String(req.body?.name || role === 'god' ? 'God' : 'Superior').trim().slice(0, 40) || role;
-  const message = String(req.body?.message || '').trim().slice(0, 300);
-  const title = String(req.body?.title || 'BUZZER 2.0').trim().slice(0, 80);
-  const duration = String(Math.max(1, Math.min(300, Number(req.body?.duration) || 60)));
-  const volume = String(Math.max(0, Math.min(100, Number(req.body?.volume) || 100)));
-  const pattern = String(req.body?.vibration_pattern || '0,600,250,600,250,1000').slice(0, 150);
-  if (command === 'summon' && getRemainingCooldown() > 0) {
-    const waitSeconds = Math.ceil(getRemainingCooldown() / 1000);
-    return res.status(429).json({ error: `Summon cooldown active for ${waitSeconds}s.`, waitSeconds });
-  }
-  try {
-    await sendFcm({ type: 'control', command, name, message, title, duration, volume, vibration_pattern: pattern });
-    if (command === 'summon') lastSentAt = Date.now();
-    lastDelivery = { status: 'delivered', name, command, at: new Date().toISOString() };
-    addHistory({ name, command, status: 'delivered', access: role });
-    res.json({ ok: true, command, role });
-  } catch (error) {
-    console.error(`${role.toUpperCase()} COMMAND ERROR:`, error);
-    addHistory({ name, command, status: 'failed', access: role });
-    res.status(502).json({ error: `Could not send command: ${error.message}` });
-  }
-}
-
-app.post('/api/superior/command', requireRole('superior'), (req, res) => sendAuthorizedCommand(req, res, req.auth.role));
-app.post('/api/god/command', requireRole('god'), (req, res) => sendAuthorizedCommand(req, res, 'god'));
-
-app.get('/api/history', (req, res) => res.json({ history }));
-app.get('/api/status', (req, res) => {
-  const remainingMs = getRemainingCooldown();
-  res.json({ online: true, ready: remainingMs === 0, cooldownSeconds: Math.ceil(remainingMs / 1000), pending: 0, lastDelivery });
-});
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-app.listen(PORT, '0.0.0.0', async () => { console.log(`Buzzer 2.0 server listening on port ${PORT}`); await loadHistory(); });
+const COOLDOWN_MS = 60_000, HISTORY_LIMIT = 50, SESSION_MS = 12 * 60 * 60 * 1000;
+let lastSentAt = 0, history = [], historyDb = null;
+let lastDelivery = { status:'ready', name:null, command:null, at:null };
+const sessions = new Map(), loginAttempts = new Map();
+app.use(express.json({limit:'12kb'})); app.use(express.static(__dirname));
+function initFirebase(){if(admin.apps.length)return;const raw=process.env.FIREBASE_SERVICE_ACCOUNT_JSON;if(!raw)throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not configured');let s;try{s=JSON.parse(raw)}catch{throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON')}admin.initializeApp({credential:admin.credential.cert(s)})}
+function getHistoryDb(){initFirebase();if(!historyDb)historyDb=admin.firestore().collection('summonHistory');return historyDb}
+async function loadHistory(){try{const snap=await getHistoryDb().orderBy('atMs','desc').limit(HISTORY_LIMIT).get();history=snap.docs.map(doc=>{const d=doc.data();return{name:d.name||'',command:d.command||null,status:d.status||'delivered',access:d.access||null,at:new Date(d.atMs||Date.now()).toISOString()}})}catch(e){console.error('HISTORY LOAD ERROR:',e.message)}}
+function addHistory(entry){const r={...entry,at:new Date().toISOString()};history.unshift(r);history=history.slice(0,HISTORY_LIMIT);try{getHistoryDb().add({name:r.name||'',command:r.command||null,status:r.status||'delivered',access:r.access||null,atMs:Date.now()}).catch(e=>console.error('HISTORY SAVE ERROR:',e.message))}catch(e){console.error('HISTORY SAVE ERROR:',e.message)}}
+async function sendFcm(data){if(!FCM_DEVICE_TOKEN)throw new Error('FCM_DEVICE_TOKEN is not configured');initFirebase();const clean={};for(const[k,v]of Object.entries(data))clean[k]=String(v??'').slice(0,500);await admin.messaging().send({token:FCM_DEVICE_TOKEN,data:clean,android:{priority:'high',ttl:60000}})}
+function getRemainingCooldown(){return Math.max(0,COOLDOWN_MS-(Date.now()-lastSentAt))}
+function getClientIp(req){return String(req.headers['x-forwarded-for']||req.ip||'unknown').split(',')[0].trim()}
+function issueSession(role){const token=crypto.randomBytes(32).toString('hex');sessions.set(token,{role,expires:Date.now()+SESSION_MS});return token}
+function requireRole(role){return(req,res,next)=>{const token=req.headers.authorization?.startsWith('Bearer ')?req.headers.authorization.slice(7):null;const s=token?sessions.get(token):null;const allowed= s && s.expires>=Date.now() && (role==='superior' ? (s.role==='superior'||s.role==='god') : s.role==='god');if(!allowed){if(token&&s?.expires<Date.now())sessions.delete(token);return res.status(401).json({error:`${role==='god'?'God':'Superior'} authentication required.`})}req.auth=s;req.authToken=token;next()}}
+function loginForRole(role,password,req,res){const configured=role==='god'?GOD_PASSWORD:SUPERIOR_PASSWORD;if(!configured)return res.status(503).json({error:`${role==='god'?'GOD_PASSWORD':'SUPERIOR_PASSWORD'} is not configured on the server.`});const key=`${role}:${getClientIp(req)}`,now=Date.now(),recent=(loginAttempts.get(key)||[]).filter(t=>now-t<600000);if(recent.length>=10)return res.status(429).json({error:'Too many login attempts. Try again later.'});recent.push(now);loginAttempts.set(key,recent);const a=Buffer.from(String(password||'')),b=Buffer.from(configured),valid=a.length===b.length&&crypto.timingSafeEqual(a,b);if(!valid)return res.status(401).json({error:`Incorrect ${role==='god'?'God':'Superior'} password.`});const token=issueSession(role);res.json({ok:true,role,token,expiresInSeconds:Math.floor(SESSION_MS/1000)})}
+app.post('/api/superior/login',(req,res)=>loginForRole('superior',req.body?.password,req,res));
+app.post('/api/god/login',(req,res)=>loginForRole('god',req.body?.password,req,res));
+app.post('/api/superior/logout',requireRole('superior'),(req,res)=>{sessions.delete(req.authToken);res.json({ok:true})});
+app.post('/api/god/logout',requireRole('god'),(req,res)=>{sessions.delete(req.authToken);res.json({ok:true})});
+const DEVICE_COMMANDS=new Set(['summon','vibrate','stop_vibration','stop_alarm','notification','wake']);
+app.get('/api/superior/status',requireRole('superior'),(req,res)=>res.json({ok:true,authenticated:true,role:req.auth.role,controls:[...DEVICE_COMMANDS]}));
+app.get('/api/god/status',requireRole('god'),(req,res)=>res.json({ok:true,authenticated:true,role:'god',controls:[...DEVICE_COMMANDS]}));
+app.post('/api/buzz',async(req,res)=>{const name=String(req.body?.name||'').trim().slice(0,40),message=String(req.body?.message||'').trim().slice(0,300);if(!name)return res.status(400).json({error:'Your name is required.'});const rem=getRemainingCooldown();if(rem>0)return res.status(429).json({error:`The summon button is on cooldown. Try again in ${Math.ceil(rem/1000)}s.`,waitSeconds:Math.ceil(rem/1000)});try{await sendFcm({name,message,command:'summon',type:'buzz'});lastSentAt=Date.now();lastDelivery={status:'delivered',name,command:'summon',at:new Date().toISOString()};addHistory({name,command:'summon',status:'delivered',access:'public'});res.json({ok:true,mode:'sent',cooldownSeconds:60})}catch(e){console.error('BUZZ ERROR:',e);addHistory({name,command:'summon',status:'failed',access:'public'});res.status(502).json({error:`Could not send buzz: ${e.message}`})}});
+async function sendAuthorizedCommand(req,res,role){const command=String(req.body?.command||'').trim().toLowerCase();if(!DEVICE_COMMANDS.has(command))return res.status(400).json({error:'Unsupported control.'});const fallback=role==='god'?'God':'Superior';const name=String(req.body?.name||fallback).trim().slice(0,40)||fallback,message=String(req.body?.message||'').trim().slice(0,300),title=String(req.body?.title||'BUZZER 2.0').trim().slice(0,80),duration=String(Math.max(1,Math.min(300,Number(req.body?.duration)||60))),volume=String(Math.max(0,Math.min(100,Number(req.body?.volume)||100))),pattern=String(req.body?.vibration_pattern||'0,600,250,600,250,1000').slice(0,150);if(command==='summon'&&getRemainingCooldown()>0){const w=Math.ceil(getRemainingCooldown()/1000);return res.status(429).json({error:`Summon cooldown active for ${w}s.`,waitSeconds:w})}try{await sendFcm({type:'control',command,name,message,title,duration,volume,vibration_pattern:pattern});if(command==='summon')lastSentAt=Date.now();lastDelivery={status:'delivered',name,command,at:new Date().toISOString()};addHistory({name,command,status:'delivered',access:role});res.json({ok:true,command,role})}catch(e){console.error(`${role.toUpperCase()} COMMAND ERROR:`,e);addHistory({name,command,status:'failed',access:role});res.status(502).json({error:`Could not send command: ${e.message}`})}}
+app.post('/api/superior/command',requireRole('superior'),(req,res)=>sendAuthorizedCommand(req,res,req.auth.role));
+app.post('/api/god/command',requireRole('god'),(req,res)=>sendAuthorizedCommand(req,res,'god'));
+app.get('/api/history',(req,res)=>res.json({history}));app.get('/api/status',(req,res)=>{const rem=getRemainingCooldown();res.json({online:true,ready:rem===0,cooldownSeconds:Math.ceil(rem/1000),pending:0,lastDelivery})});app.get('/health',(req,res)=>res.json({ok:true}));
+app.listen(PORT,'0.0.0.0',async()=>{console.log(`Buzzer 2.0 server listening on port ${PORT}`);await loadHistory()});
