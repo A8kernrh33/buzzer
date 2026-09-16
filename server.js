@@ -6,6 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FCM_DEVICE_TOKEN = process.env.FCM_DEVICE_TOKEN;
 const SUPERIOR_PASSWORD = process.env.SUPERIOR_PASSWORD;
+const GOD_PASSWORD = process.env.GOD_PASSWORD;
 const COOLDOWN_MS = 60_000;
 const HISTORY_LIMIT = 50;
 const SESSION_MS = 12 * 60 * 60 * 1000;
@@ -41,7 +42,7 @@ async function loadHistory() {
     const snapshot = await getHistoryDb().orderBy('atMs', 'desc').limit(HISTORY_LIMIT).get();
     history = snapshot.docs.map(doc => {
       const d = doc.data();
-      return { name: d.name || '', command: d.command || null, status: d.status || 'delivered', at: new Date(d.atMs || Date.now()).toISOString() };
+      return { name: d.name || '', command: d.command || null, status: d.status || 'delivered', access: d.access || null, at: new Date(d.atMs || Date.now()).toISOString() };
     });
   } catch (error) { console.error('HISTORY LOAD ERROR:', error.message); }
 }
@@ -51,7 +52,7 @@ function addHistory(entry) {
   history.unshift(record);
   history = history.slice(0, HISTORY_LIMIT);
   try {
-    getHistoryDb().add({ name: record.name || '', command: record.command || null, status: record.status || 'delivered', atMs: Date.now() })
+    getHistoryDb().add({ name: record.name || '', command: record.command || null, status: record.status || 'delivered', access: record.access || null, atMs: Date.now() })
       .catch(error => console.error('HISTORY SAVE ERROR:', error.message));
   } catch (error) { console.error('HISTORY SAVE ERROR:', error.message); }
 }
@@ -66,60 +67,71 @@ async function sendFcm(data) {
 
 function getRemainingCooldown() { return Math.max(0, COOLDOWN_MS - (Date.now() - lastSentAt)); }
 function getClientIp(req) { return String(req.headers['x-forwarded-for'] || req.ip || 'unknown').split(',')[0].trim(); }
-function issueSession() { const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, Date.now() + SESSION_MS); return token; }
-
-function requireSuperior(req, res, next) {
-  const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : req.cookies?.superior_session;
-  const expires = token ? sessions.get(token) : null;
-  if (!expires || expires < Date.now()) {
-    if (token) sessions.delete(token);
-    return res.status(401).json({ error: 'Superior authentication required.' });
-  }
-  req.superiorToken = token;
-  next();
+function issueSession(role) { const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, { role, expires: Date.now() + SESSION_MS }); return token; }
+function requireRole(role) {
+  return (req, res, next) => {
+    const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+    const session = token ? sessions.get(token) : null;
+    if (!session || session.expires < Date.now() || (role === 'superior' && session.role !== 'superior' && session.role !== 'god') || (role === 'god' && session.role !== 'god')) {
+      if (token && session?.expires < Date.now()) sessions.delete(token);
+      return res.status(401).json({ error: `${role === 'god' ? 'God' : 'Superior'} authentication required.` });
+    }
+    req.auth = session;
+    req.authToken = token;
+    next();
+  };
 }
 
-app.post('/api/superior/login', (req, res) => {
-  if (!SUPERIOR_PASSWORD) return res.status(503).json({ error: 'SUPERIOR_PASSWORD is not configured on the server.' });
+function loginForRole(role, password, req, res) {
+  const configured = role === 'god' ? GOD_PASSWORD : SUPERIOR_PASSWORD;
+  if (!configured) return res.status(503).json({ error: `${role === 'god' ? 'GOD_PASSWORD' : 'SUPERIOR_PASSWORD'} is not configured on the server.` });
   const ip = getClientIp(req), now = Date.now();
-  const recent = (loginAttempts.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
+  const key = `${role}:${ip}`;
+  const recent = (loginAttempts.get(key) || []).filter(t => now - t < 10 * 60 * 1000);
   if (recent.length >= 10) return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
-  recent.push(now); loginAttempts.set(ip, recent);
-  const supplied = String(req.body?.password || ''), a = Buffer.from(supplied), b = Buffer.from(SUPERIOR_PASSWORD);
+  recent.push(now); loginAttempts.set(key, recent);
+  const supplied = String(password || ''), a = Buffer.from(supplied), b = Buffer.from(configured);
   const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
-  if (!valid) return res.status(401).json({ error: 'Incorrect Superior password.' });
-  const token = issueSession();
-  res.json({ ok: true, token, expiresInSeconds: Math.floor(SESSION_MS / 1000) });
-});
+  if (!valid) return res.status(401).json({ error: `Incorrect ${role === 'god' ? 'God' : 'Superior'} password.` });
+  const token = issueSession(role);
+  res.json({ ok: true, role, token, expiresInSeconds: Math.floor(SESSION_MS / 1000) });
+}
 
-app.post('/api/superior/logout', requireSuperior, (req, res) => { sessions.delete(req.superiorToken); res.json({ ok: true }); });
-app.get('/api/superior/status', requireSuperior, (req, res) => res.json({ ok: true, authenticated: true, controls: ['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake'] }));
+app.post('/api/superior/login', (req, res) => loginForRole('superior', req.body?.password, req, res));
+app.post('/api/god/login', (req, res) => loginForRole('god', req.body?.password, req, res));
+
+app.post('/api/superior/logout', requireRole('superior'), (req, res) => { sessions.delete(req.authToken); res.json({ ok: true }); });
+app.post('/api/god/logout', requireRole('god'), (req, res) => { sessions.delete(req.authToken); res.json({ ok: true }); });
+
+app.get('/api/superior/status', requireRole('superior'), (req, res) => res.json({ ok: true, authenticated: true, role: req.auth.role, controls: ['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake'] }));
+app.get('/api/god/status', requireRole('god'), (req, res) => res.json({ ok: true, authenticated: true, role: 'god', controls: ['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake'] }));
 
 app.post('/api/buzz', async (req, res) => {
   const name = String(req.body?.name || '').trim().slice(0, 40);
   const message = String(req.body?.message || '').trim().slice(0, 300);
-  if (!name) return res.status(400).json({ error: 'Superior name is required.' });
+  if (!name) return res.status(400).json({ error: 'Your name is required.' });
   const remainingMs = getRemainingCooldown();
   if (remainingMs > 0) return res.status(429).json({ error: `The summon button is on cooldown. Try again in ${Math.ceil(remainingMs / 1000)}s.`, waitSeconds: Math.ceil(remainingMs / 1000) });
   try {
     await sendFcm({ name, message, command: 'summon', type: 'buzz' });
     lastSentAt = Date.now();
     lastDelivery = { status: 'delivered', name, command: 'summon', at: new Date().toISOString() };
-    addHistory({ name, command: 'summon', status: 'delivered' });
+    addHistory({ name, command: 'summon', status: 'delivered', access: 'public' });
     res.json({ ok: true, mode: 'sent', cooldownSeconds: 60 });
   } catch (error) {
     console.error('BUZZ ERROR:', error);
-    addHistory({ name, command: 'summon', status: 'failed' });
+    addHistory({ name, command: 'summon', status: 'failed', access: 'public' });
     lastDelivery = { status: 'error', name, command: error.message, at: new Date().toISOString() };
     res.status(502).json({ error: `Could not send buzz: ${error.message}` });
   }
 });
 
-app.post('/api/superior/command', requireSuperior, async (req, res) => {
-  const allowed = new Set(['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake']);
+const DEVICE_COMMANDS = new Set(['summon', 'vibrate', 'stop_vibration', 'stop_alarm', 'notification', 'wake']);
+
+async function sendAuthorizedCommand(req, res, role) {
   const command = String(req.body?.command || '').trim().toLowerCase();
-  if (!allowed.has(command)) return res.status(400).json({ error: 'Unsupported control.' });
-  const name = String(req.body?.name || 'Superior').trim().slice(0, 40) || 'Superior';
+  if (!DEVICE_COMMANDS.has(command)) return res.status(400).json({ error: 'Unsupported control.' });
+  const name = String(req.body?.name || role === 'god' ? 'God' : 'Superior').trim().slice(0, 40) || role;
   const message = String(req.body?.message || '').trim().slice(0, 300);
   const title = String(req.body?.title || 'BUZZER 2.0').trim().slice(0, 80);
   const duration = String(Math.max(1, Math.min(300, Number(req.body?.duration) || 60)));
@@ -133,14 +145,17 @@ app.post('/api/superior/command', requireSuperior, async (req, res) => {
     await sendFcm({ type: 'control', command, name, message, title, duration, volume, vibration_pattern: pattern });
     if (command === 'summon') lastSentAt = Date.now();
     lastDelivery = { status: 'delivered', name, command, at: new Date().toISOString() };
-    addHistory({ name, command, status: 'delivered' });
-    res.json({ ok: true, command });
+    addHistory({ name, command, status: 'delivered', access: role });
+    res.json({ ok: true, command, role });
   } catch (error) {
-    console.error('SUPERIOR COMMAND ERROR:', error);
-    addHistory({ name, command, status: 'failed' });
+    console.error(`${role.toUpperCase()} COMMAND ERROR:`, error);
+    addHistory({ name, command, status: 'failed', access: role });
     res.status(502).json({ error: `Could not send command: ${error.message}` });
   }
-});
+}
+
+app.post('/api/superior/command', requireRole('superior'), (req, res) => sendAuthorizedCommand(req, res, req.auth.role));
+app.post('/api/god/command', requireRole('god'), (req, res) => sendAuthorizedCommand(req, res, 'god'));
 
 app.get('/api/history', (req, res) => res.json({ history }));
 app.get('/api/status', (req, res) => {
